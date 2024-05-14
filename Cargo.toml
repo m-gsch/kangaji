@@ -1,0 +1,10 @@
+[package]
+name = "kangaji"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.82"
+kvm-bindings = { version = "0.8", features = ["serde"] }
+kvm-ioctls = "0.17"
+libc = "0.2"
