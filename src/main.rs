@@ -4,11 +4,9 @@ use std::ptr::null_mut;
 
 use anyhow::{anyhow, Result};
 use kvm_bindings::{
-    kvm_guest_debug, kvm_guest_debug_arch, kvm_msr_entry, kvm_pit_config, kvm_segment,
-    kvm_userspace_memory_region, Msrs, KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_SINGLESTEP,
-    KVM_GUESTDBG_USE_SW_BP, KVM_MAX_CPUID_ENTRIES, KVM_MEM_LOG_DIRTY_PAGES,
+    kvm_guest_debug, kvm_guest_debug_arch, kvm_msr_entry, kvm_pit_config, kvm_segment, kvm_userspace_memory_region, Msrs, KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_SINGLESTEP, KVM_GUESTDBG_USE_HW_BP, KVM_GUESTDBG_USE_SW_BP, KVM_MAX_CPUID_ENTRIES, KVM_MEM_LOG_DIRTY_PAGES
 };
-use kvm_ioctls::{Kvm, VcpuExit, VcpuFd};
+use kvm_ioctls::{Kvm, SyncReg, VcpuExit, VcpuFd};
 
 struct GuestVM {
     physmem_base: u64,
@@ -356,7 +354,9 @@ impl GuestVM {
         vm.create_pit2(pit_config)?;
 
         // 3. Create one vCPU.
-        let vcpu_fd = vm.create_vcpu(0)?;
+        let mut vcpu_fd = vm.create_vcpu(0)?;
+        vcpu_fd.set_sync_valid_reg(SyncReg::Register);
+        vcpu_fd.set_sync_valid_reg(SyncReg::SystemRegister);
 
         // Create the local APIC
         let apic = vcpu_fd.get_lapic()?;
@@ -375,10 +375,10 @@ impl GuestVM {
 
         // Setup debug mode for the guest
         let debug_struct = kvm_guest_debug {
-            control: KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_SW_BP | KVM_GUESTDBG_SINGLESTEP,
+            control: KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_HW_BP |KVM_GUESTDBG_USE_SW_BP | KVM_GUESTDBG_SINGLESTEP,
             pad: 0,
             arch: kvm_guest_debug_arch {
-                debugreg: [0x000055555555537f, 0, 0, 0, 0, 0, 0, 0x400],
+                debugreg: [0xffffffff81099cb0, 0, 0, 0, 0, 0, 0, 0x402],
             },
         };
 
@@ -455,7 +455,7 @@ impl GuestVM {
         let pml4_index = (virt_addr >> 39) & 0x1ff;
         let pml4e_addr = pml4_addr + (pml4_index << 3);
         let pml4_entry = self.read_phys::<u64>(pml4e_addr);
-        println!("{pml4_entry:#x}");
+        // println!("{pml4_entry:#x}");
 
         // Get Page-Directory-Pointer Table (PDPT) address from PML4E
         // 0 (P) Present; must be 1 to reference a page-directory-pointer table
@@ -472,6 +472,7 @@ impl GuestVM {
         // 51:M Reserved (must be 0)
         // 62:52 Ignored
         // 63 (XD) If IA32_EFER.NXE = 1, execute-disable (if 1, instruction fetches are not allowed from the 512-GByte region controlled by this entry); otherwise, reserved (must be 0)
+        assert!(pml4_entry & 1 == 1,"PML4E not present!");
         let pdpt_addr = pml4_entry & 0x000f_ffff_ffff_f000;
 
         // Get PDPT entry (PDPTE) from linear address
@@ -481,7 +482,7 @@ impl GuestVM {
         let pdpt_index = (virt_addr >> 30) & 0x1ff;
         let pdpte_addr = pdpt_addr + (pdpt_index << 3);
         let pdpt_entry = self.read_phys::<u64>(pdpte_addr);
-        println!("{pdpt_entry:#x}");
+        // println!("{pdpt_entry:#x}");
 
         // Get Page Directory (PD) address from PDPTE
         // 0 (P) Present; must be 1 to reference a page directory
@@ -498,6 +499,8 @@ impl GuestVM {
         // 51:M Reserved (must be 0)
         // 62:52 Ignored
         // 63 (XD) If IA32_EFER.NXE = 1, execute-disable (if 1, instruction fetches are not allowed from the 1-GByte region controlled by this entry); otherwise, reserved (must be 0)
+        assert!(pdpt_entry & 1 == 1,"PDPTE not present!");
+        assert!(pdpt_entry >> 7 & 1 == 0,"PDPTE maps a 1-GByte page!");
         let pd_addr = pdpt_entry & 0x000f_ffff_ffff_f000;
 
         // Get PD entry (PDE) from linear address
@@ -507,7 +510,7 @@ impl GuestVM {
         let pd_index = (virt_addr >> 21) & 0x1ff;
         let pde_addr = pd_addr + (pd_index << 3);
         let pd_entry = self.read_phys::<u64>(pde_addr);
-        println!("{pd_entry:#x}");
+        // println!("{pd_entry:#x}");
 
         // Get Page Table (PT) address from PDE
         // 0 (P) Present; must be 1 to reference a page table
@@ -524,6 +527,33 @@ impl GuestVM {
         // 51:M Reserved (must be 0)
         // 62:52 Ignored
         // 63 (XD) If IA32_EFER.NXE = 1, execute-disable (if 1, instruction fetches are not allowed from the 2-MByte region controlled by this entry); otherwise, reserved (must be 0)
+        assert!(pd_entry & 1 == 1,"PDE not present!");
+
+        if pd_entry >> 7 & 1 == 1 {
+            // PDE maps a 2-MByte page!
+            // Get 2-MByte Page from PDE
+            // 0 (P) Present; must be 1 to map a 2-MByte page
+            // 1 (R/W) Read/write; if 0, writes may not be allowed to the 2-MByte page referenced by this entry
+            // 2 (U/S) User/supervisor; if 0, user-mode accesses are not allowed to the 2-MByte page referenced by this entry
+            // 3 (PWT) Page-level write-through; indirectly determines the memory type used to access the 2-MByte page referenced by this entry
+            // 4 (PCD) Page-level cache disable; indirectly determines the memory type used to access the 2-MByte page referenced by this entry
+            // 5 (A) Accessed; indicates whether software has accessed the 2-MByte page referenced by this entry
+            // 6 (D) Dirty; indicates whether software has written to the 2-MByte page referenced by this entry
+            // 7 (PS) Page size; must be 1 (otherwise, this entry references a page table)
+            // 8 (G) Global; if CR4.PGE = 1, determines whether the translation is global; ignored otherwise
+            // 10:9 Ignored
+            // 11 (R) For ordinary paging, ignored; for HLAT paging, restart (if 1, linear-address translation is restarted with ordinary paging)
+            // 12 (PAT) Indirectly determines the memory type used to access the 2-MByte page referenced by this entry 
+            // 20:13 Reserved (must be 0)
+            // (M–1):21 Physical address of the 2-MByte page referenced by this entry
+            // 51:M Reserved (must be 0)
+            // 58:52 Ignored
+            // 62:59 Protection key; if CR4.PKE = 1 or CR4.PKS = 1, this may control the page’s access rights; otherwise, it is ignored and not used to control access rights.
+            // 63 (XD) If IA32_EFER.NXE = 1, execute-disable (if 1, instruction fetches are not allowed from the 2-MByte page controlled by this entry); otherwise, reserved (must be 0)
+            let page_addr = pd_entry & 0x000f_ffff_fffe_0000;
+            let page_offset = virt_addr & 0x1f_ffff;
+            return page_addr + page_offset
+        }
         let pt_addr = pd_entry & 0x000f_ffff_ffff_f000;
 
         // Get PT entry (PTE) from linear address
@@ -533,7 +563,7 @@ impl GuestVM {
         let pt_index = (virt_addr >> 12) & 0x1ff;
         let pte_addr = pt_addr + (pt_index << 3);
         let pt_entry = self.read_phys::<u64>(pte_addr);
-        println!("{pt_entry:#x}");
+        // println!("{pt_entry:#x}");
 
         // Get 4-KByte Page from PTE
         // 0 (P) Present; must be 1 to map a 4-KByte page
@@ -552,6 +582,7 @@ impl GuestVM {
         // 58:52 Ignored
         // 62:59 Protection key; if CR4.PKE = 1 or CR4.PKS = 1, this may control the page’s access rights;otherwise, it is ignored and not used to control access rights.
         // 63 (XD) If IA32_EFER.NXE = 1, execute-disable (if 1, instruction fetches are not allowed from the 4-KByte page controlled bythis entry); otherwise, reserved (must be 0)
+        assert!(pt_entry & 1 == 1,"PTE not present!");
         let page_addr = pt_entry & 0x000f_ffff_ffff_f000;
 
         // Get physical address from 4-KByte Page
@@ -566,7 +597,7 @@ impl GuestVM {
     }
     fn read_virt<T: Copy>(&self, virt_addr: u64) -> T {
         let phys_addr = self.translate_addr(virt_addr);
-        println!("Phys addr: {phys_addr:#x}");
+        // println!("Phys addr: {phys_addr:#x}");
         self.read_phys::<T>(phys_addr)
     }
     fn write_phys<T>(&self, phys_addr: u64, value: T) {
@@ -577,7 +608,7 @@ impl GuestVM {
     }
     fn write_virt<T>(&self, virt_addr: u64, value: T) {
         let phys_addr = self.translate_addr(virt_addr);
-        println!("Phys addr: {phys_addr:#x}");
+        // println!("Phys addr: {phys_addr:#x}");
         self.write_phys(phys_addr, value);
     }
 
@@ -585,65 +616,57 @@ impl GuestVM {
         // Run code on the vCPU.
         loop {
             match self.vcpu.run().expect("run failed") {
-                VcpuExit::IoIn(addr, data) => {
-                    println!("VcpuExit::IoIn addr:{addr:#x} data:{data:#x?}.");
-                    let regs = self.vcpu.get_regs().unwrap();
-                    println!("{regs:#x?}");
-                }
-                VcpuExit::IoOut(addr, data) => {
-                    println!("VcpuExit::IoOut addr:{addr:#x} data:{data:#x?}.");
-                    let regs = self.vcpu.get_regs().unwrap();
-                    println!("{regs:#x?}");
-                }
-                VcpuExit::MmioRead(addr, data) => {
-                    println!("VcpuExit::MmioRead addr:{addr:#x} data:{data:#x?}.");
-                    let regs = self.vcpu.get_regs().unwrap();
-                    println!("{regs:#x?}");
-                }
-                VcpuExit::MmioWrite(addr, data) => {
-                    println!("VcpuExit::MmioWrite addr:{addr:#x} data:{data:#x?}.");
-                    let regs = self.vcpu.get_regs().unwrap();
-                    println!("{regs:#x?}");
-                }
-                VcpuExit::Hlt => {
-                    println!("VcpuExit::Hlt");
-                    let regs = self.vcpu.get_regs().unwrap();
-                    println!("{regs:#x?}");
-                }
                 VcpuExit::Debug(debug_exit) => {
-                    println!("VcpuExit::Debug");
-                    let mut regs = self.vcpu.get_regs().unwrap();
-                    let mut sregs = self.vcpu.get_sregs().unwrap();
-                    let rip = regs.rip;
-                    let cr3 = sregs.cr3;
+                    let exception = debug_exit.exception;
+                    println!("VcpuExit::Debug {exception:#x}");
+                    let rip = self.vcpu.sync_regs().regs.rip;
+                    let cr3 = self.vcpu.sync_regs().sregs.cr3;
                     println!("{rip:#x?} {cr3:#x}");
-                    if regs.rip == 0x00007ffff7fbef1a {
-                        let rsp = regs.rsp;
+                    if  self.vcpu.sync_regs().regs.rip == 0x00007ffff7fbef1a {
+                        let rsp =  self.vcpu.sync_regs().regs.rsp;
                         let ret_addr = self.read_virt::<u64>(rsp);
                         println!("RSP: {rsp:#x} -> {ret_addr:#x}");
+                        let mut regs = self.vcpu.get_regs().unwrap();
                         regs.rip = ret_addr;
+                        regs.rsp += 8;
                         regs.rax = 0xdeadbeef;
                         self.vcpu.set_regs(&regs).unwrap();
                     }
-                    if regs.rip == 0x000055555555537f {
+                    if  self.vcpu.sync_regs().regs.rip == 0x000055555555537f {
+                        println!("End of run!");
                         break;
                     }
-                    if regs.rip == 0xffffffff81099cb0 {
-                        let signal = i32::try_from(regs.rdi).unwrap();
-                        if signal == libc::SIGTRAP {
+                    if  self.vcpu.sync_regs().regs.rip == 0xffffffff81099cb0 {
+                        let signal = i32::try_from( self.vcpu.sync_regs().regs.rdi).unwrap();
+                        if signal == libc::SIGSEGV {
+                            println!("We found a crash!");
+                            break;
                             // Immediate return
-                            println!("{regs:#x?}");
-                            regs.rip = 0xffffffff81e89ae1;
-                            regs.rsp += 8;
-                            self.vcpu.set_regs(&regs).unwrap();
+                            // let rsp = regs.rsp;
+                            // let ret_addr = self.read_virt::<u64>(rsp);
+                            // println!("RSP: {rsp:#x} -> {ret_addr:#x}");
+                            // regs.rip = ret_addr;
+                            // regs.rsp += 8;
+                            // self.vcpu.set_regs(&regs).unwrap();
                         } else {
                             println!("Fault with different signal: {signal}");
                         }
                     }
-                    // regs.rflags &=  !0x100;
+                    // // Setup debug mode for the guest
+                    // let debug_struct = kvm_guest_debug {
+                    //     control: KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_HW_BP | KVM_GUESTDBG_SINGLESTEP,
+                    //     pad: 0,
+                    //     arch: kvm_guest_debug_arch {
+                    //         debugreg: [0xffffffff81099cb0, 0, 0, 0, 0, 0, 0, 0x402],
+                    //     },
+                    // };
+                    // // Enable guest mode in the guest
+                    // self.vcpu.set_guest_debug(&debug_struct).unwrap();
+
+                    // regs.rflags |=  0x100;
                     // self.vcpu.set_regs(&regs).unwrap();
                 }
-                r => panic!("Unexpected exit reason: VcpuExit::{:x?}", r),
+                r => panic!("Unexpected exit reason: VcpuExit::{r:x?}"),
             }
         }
     }
@@ -665,8 +688,9 @@ fn main() -> Result<()> {
     vm.write_virt(0xffffffff81099cb0, 0xcc as u8); // breakpoint in force_sig_fault
     vm.write_virt(0x00007ffff7fbef1a, 0xcc as u8); // breakpoint in getpid
     vm.write_virt(0x000055555555537f, 0xcc as u8); // end run
-    // let bytes = vm.read_virt::<[u8;32]>(0x5555555551e1);
-    // println!("{bytes:x?}");
+                                                   // let bytes = vm.read_virt::<[u8;32]>(0x5555555551e1);
+                                                   // println!("{bytes:x?}");
+    vm.write_virt(0xffffffff81041e30, 0xc3 as u8); // ret from user_single_step_report
     vm.run();
     // let phys_addr = vm.translate_addr(0x55555570de8f);
     // println!("{phys_addr:#x}");
