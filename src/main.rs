@@ -2,11 +2,18 @@ use std::fs::OpenOptions;
 use std::os::fd::AsRawFd as _;
 use std::ptr::null_mut;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Ok, Result};
 use kvm_bindings::{
-    kvm_guest_debug, kvm_guest_debug_arch, kvm_msr_entry, kvm_pit_config, kvm_segment, kvm_userspace_memory_region, Msrs, KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_SINGLESTEP, KVM_GUESTDBG_USE_HW_BP, KVM_GUESTDBG_USE_SW_BP, KVM_MAX_CPUID_ENTRIES, KVM_MEM_LOG_DIRTY_PAGES
+    kvm_guest_debug, kvm_guest_debug_arch, kvm_msr_entry, kvm_pit_config, kvm_segment,
+    kvm_userspace_memory_region, Msrs, KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_SINGLESTEP,
+    KVM_GUESTDBG_USE_HW_BP, KVM_GUESTDBG_USE_SW_BP, KVM_MAX_CPUID_ENTRIES, KVM_MEM_LOG_DIRTY_PAGES,
 };
 use kvm_ioctls::{Kvm, SyncReg, VcpuExit, VcpuFd};
+use log;
+use rand_chacha::{
+    rand_core::{RngCore, SeedableRng},
+    ChaCha8Rng,
+};
 
 struct GuestVM {
     physmem_base: u64,
@@ -26,6 +33,12 @@ struct CpuState {
     dregs: kvm_bindings::kvm_debugregs,
 }
 
+const APIC_BASE: u64 = 0xfee0_0000;
+const FORCE_SIG_FAULT_ADDR: u64 = 0xffffffff81099cb0;
+const USER_SINGLE_STEP_REPORT_ADDR: u64 = 0xffffffff81041e30;
+const LIBC_GETPID_ADDR: u64 = 0x00007ffff7fbef1a;
+const ENTRY_ADDR: u64 = 0x000055555555536e;
+const STOP_ADDR: u64 = 0x000055555555537f;
 impl CpuState {
     // Modified from Snapchange https://github.com/awslabs/snapchange/blob/main/src/cmdline.rs#L942
     fn parse_qemu_regs(&mut self, qemuregs: &str) -> Result<()> {
@@ -375,11 +388,8 @@ impl GuestVM {
 
         // Setup debug mode for the guest
         let debug_struct = kvm_guest_debug {
-            control: KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_HW_BP |KVM_GUESTDBG_USE_SW_BP | KVM_GUESTDBG_SINGLESTEP,
-            pad: 0,
-            arch: kvm_guest_debug_arch {
-                debugreg: [0xffffffff81099cb0, 0, 0, 0, 0, 0, 0, 0x402],
-            },
+            control: KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_SW_BP,
+            ..Default::default()
         };
 
         // Enable guest mode in the guest
@@ -401,7 +411,7 @@ impl GuestVM {
         let mem_region = kvm_userspace_memory_region {
             slot: 0,
             guest_phys_addr: 0,
-            memory_size: 0xfee0_0000, // APIC_BASE
+            memory_size: APIC_BASE, // APIC_BASE
             userspace_addr: physmem_base,
             flags: KVM_MEM_LOG_DIRTY_PAGES,
         };
@@ -412,9 +422,9 @@ impl GuestVM {
         // `KVM_MEM_LOG_DIRTY_PAGES` to enable the dirty log.
         let mem_region = kvm_userspace_memory_region {
             slot: 1,
-            guest_phys_addr: 0xfee0_0000 + 0x1000,
-            memory_size: physmem_size as u64 - 0xfee0_0000 - 0x1000,
-            userspace_addr: physmem_base + 0xfee0_0000 + 0x1000,
+            guest_phys_addr: APIC_BASE + 0x1000,
+            memory_size: physmem_size as u64 - APIC_BASE - 0x1000,
+            userspace_addr: physmem_base + APIC_BASE + 0x1000,
             flags: KVM_MEM_LOG_DIRTY_PAGES,
         };
 
@@ -472,7 +482,7 @@ impl GuestVM {
         // 51:M Reserved (must be 0)
         // 62:52 Ignored
         // 63 (XD) If IA32_EFER.NXE = 1, execute-disable (if 1, instruction fetches are not allowed from the 512-GByte region controlled by this entry); otherwise, reserved (must be 0)
-        assert!(pml4_entry & 1 == 1,"PML4E not present!");
+        assert!(pml4_entry & 1 == 1, "PML4E not present!");
         let pdpt_addr = pml4_entry & 0x000f_ffff_ffff_f000;
 
         // Get PDPT entry (PDPTE) from linear address
@@ -499,8 +509,8 @@ impl GuestVM {
         // 51:M Reserved (must be 0)
         // 62:52 Ignored
         // 63 (XD) If IA32_EFER.NXE = 1, execute-disable (if 1, instruction fetches are not allowed from the 1-GByte region controlled by this entry); otherwise, reserved (must be 0)
-        assert!(pdpt_entry & 1 == 1,"PDPTE not present!");
-        assert!(pdpt_entry >> 7 & 1 == 0,"PDPTE maps a 1-GByte page!");
+        assert!(pdpt_entry & 1 == 1, "PDPTE not present!");
+        assert!(pdpt_entry >> 7 & 1 == 0, "PDPTE maps a 1-GByte page!");
         let pd_addr = pdpt_entry & 0x000f_ffff_ffff_f000;
 
         // Get PD entry (PDE) from linear address
@@ -527,7 +537,7 @@ impl GuestVM {
         // 51:M Reserved (must be 0)
         // 62:52 Ignored
         // 63 (XD) If IA32_EFER.NXE = 1, execute-disable (if 1, instruction fetches are not allowed from the 2-MByte region controlled by this entry); otherwise, reserved (must be 0)
-        assert!(pd_entry & 1 == 1,"PDE not present!");
+        assert!(pd_entry & 1 == 1, "PDE not present!");
 
         if pd_entry >> 7 & 1 == 1 {
             // PDE maps a 2-MByte page!
@@ -543,7 +553,7 @@ impl GuestVM {
             // 8 (G) Global; if CR4.PGE = 1, determines whether the translation is global; ignored otherwise
             // 10:9 Ignored
             // 11 (R) For ordinary paging, ignored; for HLAT paging, restart (if 1, linear-address translation is restarted with ordinary paging)
-            // 12 (PAT) Indirectly determines the memory type used to access the 2-MByte page referenced by this entry 
+            // 12 (PAT) Indirectly determines the memory type used to access the 2-MByte page referenced by this entry
             // 20:13 Reserved (must be 0)
             // (M–1):21 Physical address of the 2-MByte page referenced by this entry
             // 51:M Reserved (must be 0)
@@ -552,7 +562,7 @@ impl GuestVM {
             // 63 (XD) If IA32_EFER.NXE = 1, execute-disable (if 1, instruction fetches are not allowed from the 2-MByte page controlled by this entry); otherwise, reserved (must be 0)
             let page_addr = pd_entry & 0x000f_ffff_fffe_0000;
             let page_offset = virt_addr & 0x1f_ffff;
-            return page_addr + page_offset
+            return page_addr + page_offset;
         }
         let pt_addr = pd_entry & 0x000f_ffff_ffff_f000;
 
@@ -582,7 +592,7 @@ impl GuestVM {
         // 58:52 Ignored
         // 62:59 Protection key; if CR4.PKE = 1 or CR4.PKS = 1, this may control the page’s access rights;otherwise, it is ignored and not used to control access rights.
         // 63 (XD) If IA32_EFER.NXE = 1, execute-disable (if 1, instruction fetches are not allowed from the 4-KByte page controlled bythis entry); otherwise, reserved (must be 0)
-        assert!(pt_entry & 1 == 1,"PTE not present!");
+        assert!(pt_entry & 1 == 1, "PTE not present!");
         let page_addr = pt_entry & 0x000f_ffff_ffff_f000;
 
         // Get physical address from 4-KByte Page
@@ -597,7 +607,7 @@ impl GuestVM {
     }
     fn read_virt<T: Copy>(&self, virt_addr: u64) -> T {
         let phys_addr = self.translate_addr(virt_addr);
-        // println!("Phys addr: {phys_addr:#x}");
+        log::debug!("virt_addr({virt_addr:#x}) -> phys_addr({phys_addr:#x})");
         self.read_phys::<T>(phys_addr)
     }
     fn write_phys<T>(&self, phys_addr: u64, value: T) {
@@ -608,93 +618,94 @@ impl GuestVM {
     }
     fn write_virt<T>(&self, virt_addr: u64, value: T) {
         let phys_addr = self.translate_addr(virt_addr);
-        // println!("Phys addr: {phys_addr:#x}");
+        log::debug!("virt_addr({virt_addr:#x}) -> phys_addr({phys_addr:#x})");
         self.write_phys(phys_addr, value);
     }
 
-    fn run(&mut self) {
+    fn is_trace(&self) -> bool {
+        1 == 0
+    }
+
+    fn run(&mut self) -> Result<VcpuExit> {
+        if self.is_trace() {
+            // Single step is on
+            let debug_struct = kvm_guest_debug {
+                control: KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_SW_BP | KVM_GUESTDBG_SINGLESTEP,
+                ..Default::default()
+            };
+            // Enable guest mode in the guest
+            self.vcpu.set_guest_debug(&debug_struct).unwrap();
+        }
         // Run code on the vCPU.
+        self.vcpu.run().context(anyhow!("KVMVcpuFdError"))
+    }
+}
+
+fn main() -> Result<()> {
+    env_logger::init();
+    let mut rng = ChaCha8Rng::seed_from_u64(0xdead_beaf_cafe_babe);
+    // testing a fuzz loop without any real reset functionality
+    loop {
+        let mut vm = GuestVM::new("fuzzvm.physmem", "fuzzvm.qemuregs")?;
+
+        // patch some stuff
+        vm.write_virt(FORCE_SIG_FAULT_ADDR, 0xcc as u8); // detect signal for crash
+        vm.write_virt(LIBC_GETPID_ADDR, 0xcc as u8); // modify pid
+        vm.write_virt(STOP_ADDR, 0xcc as u8); // end run
+        vm.write_virt(USER_SINGLE_STEP_REPORT_ADDR, 0xc3 as u8); // remove in kernel single step SIGTRAP
+
+        let mut input_data: [u8; 17] = [
+            0x66, 0x75, 0x7a, 0x7a, 0x6d, 0x65, 0x74, 0x6f, 0x73, 0x6f, 0x6c, 0x76, 0x65, 0x6d,
+            0x65, 0x61, 0x00, // "fuzzmetosolvemea\0"
+        ];
+        //  Replace a random byte in the input with a new byte
+        let offset = rng.next_u32() as usize % input_data.len();
+        let rand_byte = rng.next_u32() as u8;
+        input_data[offset] = rand_byte;
+        log::debug!("Setting byte {rand_byte:#x} at input_data[{offset}]");
+        // set input data
+        vm.write_virt(0x555555556000, input_data);
         loop {
-            match self.vcpu.run().expect("run failed") {
+            match vm.run()? {
                 VcpuExit::Debug(debug_exit) => {
-                    let exception = debug_exit.exception;
-                    println!("VcpuExit::Debug {exception:#x}");
-                    let rip = self.vcpu.sync_regs().regs.rip;
-                    let cr3 = self.vcpu.sync_regs().sregs.cr3;
-                    println!("{rip:#x?} {cr3:#x}");
-                    if  self.vcpu.sync_regs().regs.rip == 0x00007ffff7fbef1a {
-                        let rsp =  self.vcpu.sync_regs().regs.rsp;
-                        let ret_addr = self.read_virt::<u64>(rsp);
-                        println!("RSP: {rsp:#x} -> {ret_addr:#x}");
-                        let mut regs = self.vcpu.get_regs().unwrap();
+                    if vm.is_trace() {
+                        let exception = debug_exit.exception;
+                        log::debug!("VcpuExit::Debug {exception:#x}");
+                        let rip = vm.vcpu.sync_regs().regs.rip;
+                        let cr3 = vm.vcpu.sync_regs().sregs.cr3;
+                        log::debug!("{rip:#x?} {cr3:#x}");
+                    }
+                    if vm.vcpu.sync_regs().regs.rip == LIBC_GETPID_ADDR {
+                        // Hit breakpoint in getpid()
+                        // Set rax=0xdeadbeef & return
+                        let rsp = vm.vcpu.sync_regs().regs.rsp;
+                        let ret_addr = vm.read_virt::<u64>(rsp);
+                        log::debug!("RSP: {rsp:#x} -> {ret_addr:#x}");
+                        let mut regs = vm.vcpu.get_regs().unwrap();
                         regs.rip = ret_addr;
                         regs.rsp += 8;
                         regs.rax = 0xdeadbeef;
-                        self.vcpu.set_regs(&regs).unwrap();
+                        vm.vcpu.set_regs(&regs).unwrap();
                     }
-                    if  self.vcpu.sync_regs().regs.rip == 0x000055555555537f {
-                        println!("End of run!");
+                    if vm.vcpu.sync_regs().regs.rip == 0x000055555555537f {
+                        log::info!("End of run! @{:#x}", vm.vcpu.sync_regs().regs.rip);
                         break;
                     }
-                    if  self.vcpu.sync_regs().regs.rip == 0xffffffff81099cb0 {
-                        let signal = i32::try_from( self.vcpu.sync_regs().regs.rdi).unwrap();
+
+                    if vm.vcpu.sync_regs().regs.rip == FORCE_SIG_FAULT_ADDR {
+                        let signal = i32::try_from(vm.vcpu.sync_regs().regs.rdi).unwrap();
                         if signal == libc::SIGSEGV {
-                            println!("We found a crash!");
-                            break;
-                            // Immediate return
-                            // let rsp = regs.rsp;
-                            // let ret_addr = self.read_virt::<u64>(rsp);
-                            // println!("RSP: {rsp:#x} -> {ret_addr:#x}");
-                            // regs.rip = ret_addr;
-                            // regs.rsp += 8;
-                            // self.vcpu.set_regs(&regs).unwrap();
+                            log::info!("We found a crash!");
+                            return Ok(());
                         } else {
-                            println!("Fault with different signal: {signal}");
+                            log::warn!("Fault with unexpected signal: {signal}");
                         }
                     }
-                    // // Setup debug mode for the guest
-                    // let debug_struct = kvm_guest_debug {
-                    //     control: KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_HW_BP | KVM_GUESTDBG_SINGLESTEP,
-                    //     pad: 0,
-                    //     arch: kvm_guest_debug_arch {
-                    //         debugreg: [0xffffffff81099cb0, 0, 0, 0, 0, 0, 0, 0x402],
-                    //     },
-                    // };
-                    // // Enable guest mode in the guest
-                    // self.vcpu.set_guest_debug(&debug_struct).unwrap();
-
-                    // regs.rflags |=  0x100;
-                    // self.vcpu.set_regs(&regs).unwrap();
                 }
                 r => panic!("Unexpected exit reason: VcpuExit::{r:x?}"),
             }
         }
     }
-}
-
-fn main() -> Result<()> {
-    let mut vm = GuestVM::new("fuzzvm.physmem", "fuzzvm.qemuregs")?;
-
-    let input_data: [u8; 17] = [
-        0x66, 0x75, 0x7a, 0x7a, 0x6d, 0x65, 0x74, 0x6f, 0x73, 0x6f, 0x6c, 0x76, 0x65, 0x6d, 0x65,
-        0x21, 0x00, // "fuzzmetosolveme!/0"
-    ];
-    let asm_code: [u8; 5] = [
-        0x90, 0x90, 0x90, 0x90, 0x90, // nop
-    ];
-
-    vm.write_virt(0x555555556000, input_data);
-    // vm.write_virt(0x5555555551e1, asm_code);
-    vm.write_virt(0xffffffff81099cb0, 0xcc as u8); // breakpoint in force_sig_fault
-    vm.write_virt(0x00007ffff7fbef1a, 0xcc as u8); // breakpoint in getpid
-    vm.write_virt(0x000055555555537f, 0xcc as u8); // end run
-                                                   // let bytes = vm.read_virt::<[u8;32]>(0x5555555551e1);
-                                                   // println!("{bytes:x?}");
-    vm.write_virt(0xffffffff81041e30, 0xc3 as u8); // ret from user_single_step_report
-    vm.run();
-    // let phys_addr = vm.translate_addr(0x55555570de8f);
-    // println!("{phys_addr:#x}");
-
     Ok(())
 }
 
