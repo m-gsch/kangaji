@@ -1,25 +1,24 @@
 use std::fs::OpenOptions;
 use std::os::fd::AsRawFd as _;
-use std::ptr::null_mut;
+use std::ptr;
 
 use anyhow::{anyhow, Context, Ok, Result};
 use kvm_bindings::{
-    kvm_guest_debug, kvm_guest_debug_arch, kvm_msr_entry, kvm_pit_config, kvm_segment,
-    kvm_userspace_memory_region, Msrs, KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_SINGLESTEP,
-    KVM_GUESTDBG_USE_HW_BP, KVM_GUESTDBG_USE_SW_BP, KVM_MAX_CPUID_ENTRIES, KVM_MEM_LOG_DIRTY_PAGES,
+    kvm_guest_debug, kvm_msr_entry, kvm_pit_config, kvm_segment,
+    kvm_userspace_memory_region, Msrs, KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_SINGLESTEP, KVM_GUESTDBG_USE_SW_BP,
+    KVM_MAX_CPUID_ENTRIES, KVM_MEM_LOG_DIRTY_PAGES,
 };
-use kvm_ioctls::{Kvm, SyncReg, VcpuExit, VcpuFd};
+use kvm_ioctls::{Kvm, SyncReg, VcpuExit, VcpuFd, VmFd};
 use log;
-use rand_chacha::{
-    rand_core::{RngCore, SeedableRng},
-    ChaCha8Rng,
-};
+use rand::RngCore;
+mod rng;
 
 struct GuestVM {
     physmem_base: u64,
     physmem_size: usize,
     cpu_state: CpuState,
     vcpu: VcpuFd,
+    vm: VmFd
 }
 //KVM_(GET|SET)_(REGS|SREGS|FPU|MSR|LAPIC|CPUID2|GUEST_DEBUG)
 #[derive(Default, Debug)]
@@ -367,24 +366,24 @@ impl GuestVM {
         vm.create_pit2(pit_config)?;
 
         // 3. Create one vCPU.
-        let mut vcpu_fd = vm.create_vcpu(0)?;
-        vcpu_fd.set_sync_valid_reg(SyncReg::Register);
-        vcpu_fd.set_sync_valid_reg(SyncReg::SystemRegister);
+        let mut vcpu = vm.create_vcpu(0)?;
+        vcpu.set_sync_valid_reg(SyncReg::Register);
+        vcpu.set_sync_valid_reg(SyncReg::SystemRegister);
 
         // Create the local APIC
-        let apic = vcpu_fd.get_lapic()?;
+        let apic = vcpu.get_lapic()?;
 
         // Set the APIC for the guest VM
-        vcpu_fd.set_lapic(&apic)?;
+        vcpu.set_lapic(&apic)?;
 
         let cpuid = kvm.get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)?;
-        vcpu_fd.set_cpuid2(&cpuid)?;
+        vcpu.set_cpuid2(&cpuid)?;
 
         // Set xcr0 to 7 to enable avx, sse, and x87
-        let mut xcrs = vcpu_fd.get_xcrs()?;
+        let mut xcrs = vcpu.get_xcrs()?;
         xcrs.xcrs[0].xcr = 0x0;
         xcrs.xcrs[0].value = 0x7;
-        vcpu_fd.set_xcrs(&xcrs)?;
+        vcpu.set_xcrs(&xcrs)?;
 
         // Setup debug mode for the guest
         let debug_struct = kvm_guest_debug {
@@ -393,12 +392,12 @@ impl GuestVM {
         };
 
         // Enable guest mode in the guest
-        vcpu_fd.set_guest_debug(&debug_struct)?;
+        vcpu.set_guest_debug(&debug_struct)?;
 
         // 3. Initialize Guest Memory.
         let physmem_base = unsafe {
             libc::mmap(
-                null_mut(),
+                ptr::null_mut(),
                 physmem_size,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_PRIVATE,
@@ -407,7 +406,19 @@ impl GuestVM {
             ) as u64
         };
 
-        // Allocate memory from [0, APIC_BASE] in the guest
+        // Set memory regions in the guest
+        // if setting LAPIC, KVM internally creates a memory region for APIC at APIC_BASE of page size
+        // so we need to leave a "hole" there or else we get a EEXIST since memory regions overlap
+        // 0x00000000   |----------------|
+        //              |    Memory      |
+        //              |    Region      |
+        // APIC_BASE    |----------------|
+        //              |     Internal   |
+        // APIC_BASE +  | Memory Region  |
+        // 0x1000       |----------------|
+        //              |    Memory      |
+        //              |    Region      |
+        // PHYSMEM_SIZE |----------------|
         let mem_region = kvm_userspace_memory_region {
             slot: 0,
             guest_phys_addr: 0,
@@ -418,8 +429,6 @@ impl GuestVM {
 
         unsafe { vm.set_user_memory_region(mem_region)? };
 
-        // When initializing the guest memory slot specify the
-        // `KVM_MEM_LOG_DIRTY_PAGES` to enable the dirty log.
         let mem_region = kvm_userspace_memory_region {
             slot: 1,
             guest_phys_addr: APIC_BASE + 0x1000,
@@ -432,18 +441,19 @@ impl GuestVM {
 
         // 4. Initialize general purpose and special registers.
         // x86_64 specific registry setup.
-        vcpu_fd.set_regs(&cpu_state.regs)?;
-        vcpu_fd.set_sregs(&cpu_state.sregs)?;
-        vcpu_fd.set_fpu(&cpu_state.fpu)?;
+        vcpu.set_regs(&cpu_state.regs)?;
+        vcpu.set_sregs(&cpu_state.sregs)?;
+        vcpu.set_fpu(&cpu_state.fpu)?;
 
         let msrs = Msrs::from_entries(&cpu_state.msr_entries)?;
-        vcpu_fd.set_msrs(&msrs)?;
+        vcpu.set_msrs(&msrs)?;
 
         Ok(Self {
             physmem_base,
             physmem_size,
             cpu_state,
-            vcpu: vcpu_fd,
+            vcpu,
+            vm
         })
     }
     fn translate_addr(&self, virt_addr: u64) -> u64 {
@@ -465,7 +475,7 @@ impl GuestVM {
         let pml4_index = (virt_addr >> 39) & 0x1ff;
         let pml4e_addr = pml4_addr + (pml4_index << 3);
         let pml4_entry = self.read_phys::<u64>(pml4e_addr);
-        // println!("{pml4_entry:#x}");
+        log::trace!("PML4E {pml4_entry:#x}");
 
         // Get Page-Directory-Pointer Table (PDPT) address from PML4E
         // 0 (P) Present; must be 1 to reference a page-directory-pointer table
@@ -492,7 +502,7 @@ impl GuestVM {
         let pdpt_index = (virt_addr >> 30) & 0x1ff;
         let pdpte_addr = pdpt_addr + (pdpt_index << 3);
         let pdpt_entry = self.read_phys::<u64>(pdpte_addr);
-        // println!("{pdpt_entry:#x}");
+        log::trace!("PDPTE {pdpt_entry:#x}");
 
         // Get Page Directory (PD) address from PDPTE
         // 0 (P) Present; must be 1 to reference a page directory
@@ -520,7 +530,7 @@ impl GuestVM {
         let pd_index = (virt_addr >> 21) & 0x1ff;
         let pde_addr = pd_addr + (pd_index << 3);
         let pd_entry = self.read_phys::<u64>(pde_addr);
-        // println!("{pd_entry:#x}");
+        log::trace!("PDE {pd_entry:#x}");
 
         // Get Page Table (PT) address from PDE
         // 0 (P) Present; must be 1 to reference a page table
@@ -541,6 +551,7 @@ impl GuestVM {
 
         if pd_entry >> 7 & 1 == 1 {
             // PDE maps a 2-MByte page!
+            log::trace!("PDE maps a 2-MByte page");
             // Get 2-MByte Page from PDE
             // 0 (P) Present; must be 1 to map a 2-MByte page
             // 1 (R/W) Read/write; if 0, writes may not be allowed to the 2-MByte page referenced by this entry
@@ -573,7 +584,7 @@ impl GuestVM {
         let pt_index = (virt_addr >> 12) & 0x1ff;
         let pte_addr = pt_addr + (pt_index << 3);
         let pt_entry = self.read_phys::<u64>(pte_addr);
-        // println!("{pt_entry:#x}");
+        log::trace!("PTE {pt_entry:#x}");
 
         // Get 4-KByte Page from PTE
         // 0 (P) Present; must be 1 to map a 4-KByte page
@@ -607,7 +618,7 @@ impl GuestVM {
     }
     fn read_virt<T: Copy>(&self, virt_addr: u64) -> T {
         let phys_addr = self.translate_addr(virt_addr);
-        log::debug!("virt_addr({virt_addr:#x}) -> phys_addr({phys_addr:#x})");
+        log::trace!("virt_addr({virt_addr:#x}) -> phys_addr({phys_addr:#x})");
         self.read_phys::<T>(phys_addr)
     }
     fn write_phys<T>(&self, phys_addr: u64, value: T) {
@@ -618,12 +629,30 @@ impl GuestVM {
     }
     fn write_virt<T>(&self, virt_addr: u64, value: T) {
         let phys_addr = self.translate_addr(virt_addr);
-        log::debug!("virt_addr({virt_addr:#x}) -> phys_addr({phys_addr:#x})");
+        log::trace!("virt_addr({virt_addr:#x}) -> phys_addr({phys_addr:#x})");
         self.write_phys(phys_addr, value);
     }
 
     fn is_trace(&self) -> bool {
         1 == 0
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        self.vcpu.sync_regs_mut().regs = self.cpu_state.regs;
+        self.vcpu.set_sync_dirty_reg(SyncReg::Register);
+        self.vcpu.sync_regs_mut().sregs = self.cpu_state.sregs;
+        self.vcpu.set_sync_dirty_reg(SyncReg::SystemRegister);
+        self.vcpu.set_fpu(&self.cpu_state.fpu)?;
+        // Set MSRs
+        let msrs = Msrs::from_entries(&self.cpu_state.msr_entries)?;
+        self.vcpu.set_msrs(&msrs)?;
+        // Do I need to restore debugregs, xcrs & lapic?
+        // Restore pages here & clear dirty log
+        // Every bit set is a dirty page by index
+        // bitmap_index * 64(bits in u64) + bit_index
+        // using avx512 for page copy is cool and fast
+        // let dirty_pages_bitmap = self.vm.get_dirty_log(0, APIC_BASE as usize)?;
+        Ok(())
     }
 
     fn run(&mut self) -> Result<VcpuExit> {
@@ -643,23 +672,24 @@ impl GuestVM {
 
 fn main() -> Result<()> {
     env_logger::init();
-    let mut rng = ChaCha8Rng::seed_from_u64(0xdead_beaf_cafe_babe);
+    // I'm trusting Cory on this one https://twitter.com/ctfhacker/status/1233862013450948610
+    let mut rng = rng::Rng::new();
     // testing a fuzz loop without any real reset functionality
-    loop {
-        let mut vm = GuestVM::new("fuzzvm.physmem", "fuzzvm.qemuregs")?;
+    let mut vm = GuestVM::new("fuzzvm.physmem", "fuzzvm.qemuregs")?;
 
         // patch some stuff
         vm.write_virt(FORCE_SIG_FAULT_ADDR, 0xcc as u8); // detect signal for crash
         vm.write_virt(LIBC_GETPID_ADDR, 0xcc as u8); // modify pid
         vm.write_virt(STOP_ADDR, 0xcc as u8); // end run
         vm.write_virt(USER_SINGLE_STEP_REPORT_ADDR, 0xc3 as u8); // remove in kernel single step SIGTRAP
-
+    loop {
+        vm.restore()?;
         let mut input_data: [u8; 17] = [
             0x66, 0x75, 0x7a, 0x7a, 0x6d, 0x65, 0x74, 0x6f, 0x73, 0x6f, 0x6c, 0x76, 0x65, 0x6d,
             0x65, 0x61, 0x00, // "fuzzmetosolvemea\0"
         ];
-        //  Replace a random byte in the input with a new byte
-        let offset = rng.next_u32() as usize % input_data.len();
+        // replace a random byte in the input with a new byte
+        let offset = rng.next() as usize % input_data.len();
         let rand_byte = rng.next_u32() as u8;
         input_data[offset] = rand_byte;
         log::debug!("Setting byte {rand_byte:#x} at input_data[{offset}]");
@@ -702,9 +732,18 @@ fn main() -> Result<()> {
                         }
                     }
                 }
-                r => panic!("Unexpected exit reason: VcpuExit::{r:x?}"),
+                r => {
+                    log::error!("Unexpected exit reason: VcpuExit::{r:x?}");
+                    break;
+                }
             }
         }
+        // // The code snippet dirties 1 page when it is loaded in memory
+        // let dirty_pages_bitmap = vm.get_dirty_log(slot, mem_size).unwrap();
+        // let dirty_pages = dirty_pages_bitmap
+        //     .into_iter()
+        //     .map(|page| page.count_ones())
+        //     .fold(0, |dirty_page_count, i| dirty_page_count + i);
     }
     Ok(())
 }
