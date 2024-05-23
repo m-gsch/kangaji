@@ -1,5 +1,5 @@
-use anyhow::{Result,anyhow};
 use crate::kvm;
+use anyhow::{anyhow, Result};
 
 #[derive(Default, Debug)]
 pub struct CpuState {

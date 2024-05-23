@@ -1,9 +1,12 @@
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{self, BufRead};
 use std::{fs, os::fd::AsRawFd};
 
-use anyhow::{anyhow, Result, Context};
+use anyhow::{anyhow, Context, Result};
 use kvm_bindings::{
-    kvm_guest_debug, kvm_pit_config, kvm_userspace_memory_region, Msrs,
-    KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_SINGLESTEP, KVM_GUESTDBG_USE_SW_BP, KVM_MAX_CPUID_ENTRIES,
+    kvm_guest_debug, kvm_pit_config, kvm_userspace_memory_region, Msrs, KVM_GUESTDBG_ENABLE,
+    KVM_GUESTDBG_SINGLESTEP, KVM_GUESTDBG_USE_SW_BP, KVM_MAX_CPUID_ENTRIES,
     KVM_MEM_LOG_DIRTY_PAGES,
 };
 use kvm_ioctls::{Kvm, SyncReg, VcpuExit, VcpuFd, VmFd};
@@ -20,6 +23,8 @@ pub struct GuestVM {
     pub vcpu: VcpuFd,
     pub vm: VmFd,
     pub memory_regions: [MemoryRegion; 2],
+    coverage_map: HashMap<u64, u8>,
+    is_interesting: bool,
 }
 
 impl GuestVM {
@@ -106,7 +111,7 @@ impl GuestVM {
             libc::mmap(
                 std::ptr::null_mut(),
                 physmem_size,
-                libc::PROT_READ,
+                libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_PRIVATE,
                 physmem_file.as_raw_fd(),
                 0,
@@ -126,14 +131,13 @@ impl GuestVM {
         //              |    Memory      |
         //              |    Region      |
         // PHYSMEM_SIZE |----------------|
-        
 
         // For ease of access we are saving the bitmap in a u64 vector.
-            // We are using ceil to make sure we count all dirty pages even
-            // when `memory_size` is not a multiple of `page_size * 64`.
-            let div_ceil = |dividend, divisor| (dividend + divisor - 1) / divisor;
+        // We are using ceil to make sure we count all dirty pages even
+        // when `memory_size` is not a multiple of `page_size * 64`.
+        let div_ceil = |dividend, divisor| (dividend + divisor - 1) / divisor;
 
-            let bitmap_size = div_ceil(constants::APIC_BASE, constants::PAGE_SIZE * 64);
+        let bitmap_size = div_ceil(constants::APIC_BASE, constants::PAGE_SIZE * 64);
 
         let slot0_mem_region = MemoryRegion {
             dirty_bitmap: vec![0; bitmap_size as usize],
@@ -150,7 +154,10 @@ impl GuestVM {
 
         unsafe { vm.set_user_memory_region(user_mem_region)? };
 
-        let bitmap_size = div_ceil(physmem_size as u64 - constants::APIC_BASE - 0x1000, constants::PAGE_SIZE * 64);
+        let bitmap_size = div_ceil(
+            physmem_size as u64 - constants::APIC_BASE - 0x1000,
+            constants::PAGE_SIZE * 64,
+        );
         let slot1_mem_region = MemoryRegion {
             dirty_bitmap: vec![0; bitmap_size as usize],
             base: constants::APIC_BASE + 0x1000,
@@ -183,9 +190,11 @@ impl GuestVM {
             vcpu,
             vm,
             memory_regions: [slot0_mem_region, slot1_mem_region],
+            coverage_map: HashMap::new(),
+            is_interesting: false,
         })
     }
-    
+
     fn translate_addr(&self, virt_addr: u64) -> u64 {
         // Get Page Map Level 4 (PML4) table address from CR3
         // 2:0 Ignored
@@ -204,7 +213,7 @@ impl GuestVM {
 
         let pml4_index = (virt_addr >> 39) & 0x1ff;
         let pml4e_addr = pml4_addr + (pml4_index << 3);
-        let pml4_entry = self.read_phys::<u64>(pml4e_addr);
+        let pml4_entry = self.read_phys::<u64>(pml4e_addr, self.physmem_base);
         log::trace!("PML4E {pml4_entry:#x}");
 
         // Get Page-Directory-Pointer Table (PDPT) address from PML4E
@@ -231,7 +240,7 @@ impl GuestVM {
         // 51:12 are from the PML4E
         let pdpt_index = (virt_addr >> 30) & 0x1ff;
         let pdpte_addr = pdpt_addr + (pdpt_index << 3);
-        let pdpt_entry = self.read_phys::<u64>(pdpte_addr);
+        let pdpt_entry = self.read_phys::<u64>(pdpte_addr, self.physmem_base);
         log::trace!("PDPTE {pdpt_entry:#x}");
 
         // Get Page Directory (PD) address from PDPTE
@@ -259,7 +268,7 @@ impl GuestVM {
         // 51:12 are from the PDPTE
         let pd_index = (virt_addr >> 21) & 0x1ff;
         let pde_addr = pd_addr + (pd_index << 3);
-        let pd_entry = self.read_phys::<u64>(pde_addr);
+        let pd_entry = self.read_phys::<u64>(pde_addr, self.physmem_base);
         log::trace!("PDE {pd_entry:#x}");
 
         // Get Page Table (PT) address from PDE
@@ -313,7 +322,7 @@ impl GuestVM {
         // 51:12 are from the PDE
         let pt_index = (virt_addr >> 12) & 0x1ff;
         let pte_addr = pt_addr + (pt_index << 3);
-        let pt_entry = self.read_phys::<u64>(pte_addr);
+        let pt_entry = self.read_phys::<u64>(pte_addr, self.physmem_base);
         log::trace!("PTE {pt_entry:#x}");
 
         // Get 4-KByte Page from PTE
@@ -342,37 +351,68 @@ impl GuestVM {
         let page_offset = virt_addr & 0xFFF;
         page_addr + page_offset
     }
-    
-    fn read_phys<T: Copy>(&self, phys_addr: u64) -> T {
+
+    fn read_phys<T: Copy>(&self, phys_addr: u64, physmem_base: u64) -> T {
         assert!((phys_addr as usize + std::mem::size_of::<T>()) < self.physmem_size);
-        unsafe { std::ptr::read_unaligned((self.physmem_base + phys_addr) as *const T) }
+        unsafe { std::ptr::read_unaligned((physmem_base + phys_addr) as *const T) }
     }
-    
+
     pub fn read_virt<T: Copy>(&self, virt_addr: u64) -> T {
         let phys_addr = self.translate_addr(virt_addr);
         log::trace!("virt_addr({virt_addr:#x}) -> phys_addr({phys_addr:#x})");
-        self.read_phys::<T>(phys_addr)
+        self.read_phys::<T>(phys_addr, self.physmem_base)
     }
 
-    fn write_phys<T>(&self, phys_addr: u64, value: T) {
+    fn write_phys<T>(&self, phys_addr: u64, physmem_base: u64, value: T) {
         assert!((phys_addr as usize + std::mem::size_of::<T>()) < self.physmem_size);
         unsafe {
-            std::ptr::write_unaligned((self.physmem_base + phys_addr) as *mut T, value);
+            std::ptr::write_unaligned((physmem_base + phys_addr) as *mut T, value);
         }
     }
 
     pub fn write_virt<T>(&self, virt_addr: u64, value: T) {
         let phys_addr = self.translate_addr(virt_addr);
         log::trace!("virt_addr({virt_addr:#x}) -> phys_addr({phys_addr:#x})");
-        self.write_phys(phys_addr, value);
+        self.write_phys(phys_addr, self.physmem_base, value);
     }
 
-    pub fn set_breakpoint(&self, virt_addr: u64){
-        self.write_virt(virt_addr, 0xcc as u8);
+    pub fn set_breakpoint(&self, virt_addr: u64) {
+        let phys_addr = self.translate_addr(virt_addr);
+        self.write_phys(phys_addr, self.physmem_base, 0xcc as u8);
+        self.write_phys(phys_addr, self.snapshot_base, 0xcc as u8);
+    }
+
+    pub fn set_coverage_breakpoints(&mut self, covbps_filepath: &str) -> Result<()> {
+        // Open the file
+        let covbps_file = File::open(covbps_filepath)?;
+        let covbps_reader = io::BufReader::new(covbps_file);
+
+        // Read the file line by line
+        for covbps_line in covbps_reader.lines() {
+            let covbps_line = covbps_line?;
+            // Split the line by comma
+            if let Some((addr_str, _value_str)) = covbps_line.split_once(',') {
+                // Parse the address part as u64
+                if let Ok(addr) = u64::from_str_radix(&addr_str.trim_start_matches("0x"), 16) {
+                    let original_byte = self.read_virt::<u8>(addr);
+                    self.set_breakpoint(addr);
+                    self.coverage_map.insert(addr, original_byte);
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn is_trace(&self) -> bool {
         1 == 0
+    }
+
+    pub fn new_coverage(&mut self) -> bool {
+        if self.is_interesting {
+            self.is_interesting = false;
+            return true;
+        }
+        false
     }
 
     pub fn restore(&mut self) -> Result<()> {
@@ -415,7 +455,7 @@ impl GuestVM {
             }
         }
 
-        log::debug!("Restoring {} dirtied pages", dirty_pages_addr.len());
+        log::trace!("Restoring {} dirtied pages", dirty_pages_addr.len());
         // Copy each dirty page from the og snapshot
         // using avx512 for page copy would be cool and fast
         for addr in dirty_pages_addr {
@@ -445,6 +485,33 @@ impl GuestVM {
             self.vcpu.set_guest_debug(&debug_struct).unwrap();
         }
         // Run code on the vCPU.
-        self.vcpu.run().context(anyhow!("KVMVcpuFdError"))
+        loop {
+            match self.vcpu.run().context(anyhow!("KVMVcpuFdError"))? {
+                VcpuExit::Debug(debug_exit) => {
+                    if self.is_trace() {
+                        let exception = debug_exit.exception;
+                        log::debug!("VcpuExit::Debug {exception:#x}");
+                        let rip = self.vcpu.sync_regs().regs.rip;
+                        let cr3 = self.vcpu.sync_regs().sregs.cr3;
+                        log::debug!("{rip:#x?} {cr3:#x}");
+                    } else {
+                        let rip = self.vcpu.sync_regs().regs.rip;
+                        if let Some((cov_addr, original_byte)) =
+                            self.coverage_map.remove_entry(&rip)
+                        {
+                            // We hit a coverage breakpoint
+                            log::info!("Hit coverage breakpoint at @{cov_addr:#x}");
+                            let phys_addr = self.translate_addr(cov_addr);
+                            self.write_phys(phys_addr, self.physmem_base, original_byte);
+                            self.write_phys(phys_addr, self.snapshot_base, original_byte);
+                            self.is_interesting = true;
+                        } else {
+                            return Ok(VcpuExit::Debug(debug_exit));
+                        }
+                    }
+                }
+                _ => return Ok(VcpuExit::InternalError),
+            }
+        }
     }
 }
