@@ -5,7 +5,7 @@ use vmm_sys_util::ioctl::ioctl_with_ref;
 use vmm_sys_util::ioctl_iow_nr;
 
 use crate::constants;
-use crate::vm;
+use crate::kangaji;
 
 pub struct MemoryRegion {
     pub dirty_bitmap: Vec<u64>,
@@ -118,7 +118,7 @@ macro_rules! ioctl_iowr_nr {
 ioctl_iow_nr!(KVM_GET_DIRTY_LOG, KVMIO, 0x42, kvm_dirty_log);
 ioctl_iowr_nr!(KVM_CLEAR_DIRTY_LOG, KVMIO, 0xc0, kvm_clear_dirty_log);
 
-impl vm::GuestVM {
+impl kangaji::Kangaji {
     pub fn get_dirty_logs(&mut self) -> Result<()> {
         for (slot, mem_region) in self.memory_regions.iter_mut().enumerate() {
             // Create the structure for this clear

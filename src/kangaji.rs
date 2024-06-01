@@ -15,7 +15,7 @@ use crate::constants;
 use crate::cpu_state::CpuState;
 use crate::kvm::MemoryRegion;
 
-pub struct GuestVM {
+pub struct Kangaji {
     physmem_base: u64,
     physmem_size: usize,
     snapshot_base: u64,
@@ -27,7 +27,7 @@ pub struct GuestVM {
     is_interesting: bool,
 }
 
-impl GuestVM {
+impl Kangaji {
     pub fn new(physmem_path: &str, qemuregs_filepath: &str) -> Result<Self> {
         let mut cpu_state = CpuState::default();
         let qemuregs = fs::read_to_string(qemuregs_filepath)?;
