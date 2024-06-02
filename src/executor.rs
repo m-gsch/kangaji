@@ -8,7 +8,7 @@ use libafl::{
     state::{HasExecutions, State, UsesState},
     Error,
 };
-use libafl_bolts::{tuples::MatchName, AsSlice, ErrorBacktrace};
+use libafl_bolts::{tuples::MatchName, AsSlice};
 
 use crate::{constants, kangaji::Kangaji};
 
@@ -50,9 +50,6 @@ where
     ) -> Result<ExitKind, Error> {
         self.vm.restore().unwrap();
         *state.executions_mut() += 1;
-        // patch some stuff
-        self.vm
-            .write_virt(constants::USER_SINGLE_STEP_REPORT_ADDR, 0xc3 as u8); // remove in kernel single step SIGTRAP
         let data = input.target_bytes();
         let data = data.as_slice();
         let mut input_data: [u8; 17] = [
@@ -64,8 +61,8 @@ where
         }
         // set input data
         self.vm.write_virt(0x555555556000, input_data);
-        loop {
-            match self.vm.run().unwrap() {
+        while let Ok(vcpu_exit) = self.vm.run() {
+            match vcpu_exit {
                 VcpuExit::Debug(_) => {
                     if self.vm.vcpu.sync_regs().regs.rip == constants::LIBC_GETPID_ADDR {
                         // Hit breakpoint in getpid()
@@ -81,7 +78,7 @@ where
                     }
                     if self.vm.vcpu.sync_regs().regs.rip == constants::STOP_ADDR {
                         log::debug!("End of run! @{:#x}", self.vm.vcpu.sync_regs().regs.rip);
-                        break;
+                        return Ok(ExitKind::Ok);
                     }
 
                     if self.vm.vcpu.sync_regs().regs.rip == constants::FORCE_SIG_FAULT_ADDR {
@@ -100,14 +97,11 @@ where
                 }
                 r => {
                     log::error!("Unexpected exit reason: VcpuExit::{r:x?}");
-                    return Err(Error::IllegalState(
-                        "Unexpected exit reason.".to_owned(),
-                        ErrorBacktrace::default(),
-                    ));
+                    return Err(Error::illegal_state("Unexpected exit reason."));
                 }
             }
         }
-        Ok(ExitKind::Ok)
+        Err(Error::unknown("Unexpected error."))
     }
 }
 

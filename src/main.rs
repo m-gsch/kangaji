@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Ok, Result};
-use libafl::{corpus::{InMemoryCorpus, OnDiskCorpus}, events::SimpleEventManager, feedbacks::{ConstFeedback, CrashFeedback}, inputs::BytesInput, monitors::SimpleMonitor, mutators::{havoc_mutations, StdScheduledMutator}, observers::{Observer, TimeObserver}, schedulers::RandScheduler, stages::StdMutationalStage, state::StdState, Fuzzer, StdFuzzer};
+use libafl::{corpus::{InMemoryCorpus, OnDiskCorpus}, events::SimpleEventManager, feedbacks::{ConstFeedback, CrashFeedback}, inputs::BytesInput, monitors::{tui::{ui::TuiUI, TuiMonitor}, SimpleMonitor}, mutators::{havoc_mutations, StdScheduledMutator}, observers::{Observer, TimeObserver}, schedulers::RandScheduler, stages::StdMutationalStage, state::StdState, Fuzzer, StdFuzzer};
 use libafl_bolts::{rands::{self, RandomSeed}, tuples::tuple_list};
 
 mod constants;
@@ -12,59 +12,55 @@ mod executor;
 
 fn main() -> Result<()> {
     env_logger::init();
-    let mut vm = kangaji::Kangaji::new(
+    let mut kangaji = kangaji::Kangaji::new(
         "examples/01_getpid/fuzzvm.physmem",
         "examples/01_getpid/fuzzvm.qemuregs",
     )?;
+    kangaji.set_coverage_breakpoints("examples/01_getpid/example1.bin.ghidra.covbps")?;
+    kangaji.set_breakpoint(constants::FORCE_SIG_FAULT_ADDR); // detect signal for crash
+    kangaji.set_breakpoint(constants::LIBC_GETPID_ADDR); // modify pid
+    kangaji.set_breakpoint(constants::STOP_ADDR); // end run
+    // patch some stuff
+    kangaji.patch_byte(constants::USER_SINGLE_STEP_REPORT_ADDR, 0xc3); // remove in kernel single step SIGTRAP
 
     // let mut input_data: [u8; 17] = [
     //     0x66, 0x75, 0x7a, 0x7a, 0x6d, 0x65, 0x74, 0x6f, 0x73, 0x6f, 0x6c, 0x76, 0x65, 0x6d,
     //     0x65, 0x61, 0x00, // "fuzzmetosolvemea\0"
     // ];
 
-    let mut input_data: [u8; 17] = [
-        0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61,
-        0x61, 0x00, // "aaaaaaaaaaaaaaaa\0"
-    ];
+    // let input_data: [u8; 17] = [
+    //     0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61,
+    //     0x61, 0x00, // "aaaaaaaaaaaaaaaa\0"
+    // ];
 
-    let mut curr_input = input_data;
-
-    // we don't have any instrumentation in here to tell us when we find a new path
-    // so we just have no feedback
+    // The Feedback is an entity that classifies the outcome of an execution of the program under test as interesting or not.
+    // The only difference is that interesting Objectives won't be mutated further, and are counted as Solutions, a successful fuzzing campaign.
+    // https://aflplus.plus/libafl-book/core_concepts/feedback.html
     let mut feedback = ConstFeedback::False;
-
-    // Our "objective" is a feedback that tells our fuzzer when we have a win!
-    // we could include timeouts, certain outputs, created files, etc
-    // here we will just win when our target crashes
     let mut objective = CrashFeedback::new();
 
     // we need to make our monitor
     // this is just to report stats back to our screen
     // libafl includes some nicer ways to show this too, like the TuiMonitor
     let monitor = SimpleMonitor::new( |s| println!("{s}") );
+    // let ui = TuiUI::new(String::from("kangaji"), true);
+    // let monitor = TuiMonitor::new(ui);
 
-    // the event manager takes in events/stats during the fuzzer
-    // here we could programatically respond to those events
-    // but we will just use a manager that sends the events on to the monitor
+    // The EventManager interface is used to send Events over the wire using Low Level Message Passing, a custom message passing mechanism over shared memory or TCP.
+    // https://aflplus.plus/libafl-book/message_passing/message_passing.html
     let mut mgr = SimpleEventManager::new(monitor);
 
 
-    let observer = tuple_list!(TimeObserver::new("time"));
-    // we need to make our executor
-    // this defines how we execute each test case
-    // this could be using qemu, frida, or using a forkserver compiled in
-    // we will just use the most simple "CommandExecutor" which runs a child process
-    // by default it will use stdin to send over the input, unless we specify otherwise
-    let mut kangaji = executor::KangajiExecutor::new(vm,observer);
+    // An Observer is an entity that provides an information observed during the execution of the program under test to the fuzzer.
+    // https://aflplus.plus/libafl-book/core_concepts/observer.html
+    let observer = tuple_list!();
 
-    kangaji.vm.set_coverage_breakpoints("examples/01_getpid/example1.bin.ghidra.covbps")?;
-    kangaji.vm.set_breakpoint(constants::FORCE_SIG_FAULT_ADDR); // detect signal for crash
-    kangaji.vm.set_breakpoint(constants::LIBC_GETPID_ADDR); // modify pid
-    kangaji.vm.set_breakpoint(constants::STOP_ADDR); // end run
+    // An Executor is the entity that defines not only how to execute the target, but all the volatile operations that are related to just a single run of the target.
+    // https://aflplus.plus/libafl-book/core_concepts/executor.html
+    let mut executor = executor::KangajiExecutor::new(kangaji,observer);
 
-    // we need a state to hold our fuzzing state
-    // a state tracks our corpora (inputs and solutions)
-    // and other metadata
+    // The State contains all the metadata that are evolved while running the fuzzer, Corpus included.
+    // https://aflplus.plus/libafl-book/design/architecture.html
     let mut state = StdState::new(
         rands::StdRand::new(),
         InMemoryCorpus::<BytesInput>::new(),
@@ -74,22 +70,21 @@ fn main() -> Result<()> {
     ).unwrap();
 
 
-    // We need to make our stages
-    // these will be executed in order for each new executed testcase
-    // All we need are normal byte mutations for now
-    // But here we could also have tracing stages,
-    // calibration, generation, sync stages, etc
-    // see implementations of the Stage trait in LibAFL
-    let mutator = StdScheduledMutator::with_max_stack_pow(
-        havoc_mutations(),
-        9,                                                      // maximum mutation iterations
-    );
 
+    // The Mutator is an entity that takes one or more Inputs and generates a new instance of Input derived by its inputs.
+    // https://aflplus.plus/libafl-book/core_concepts/mutator.html
+    let mutator = StdScheduledMutator::new(havoc_mutations());
+
+    // A Stage is an entity that operates on a single Input received from the Corpus.
+    // https://aflplus.plus/libafl-book/core_concepts/stage.html
     let mut stages = tuple_list!(StdMutationalStage::new(mutator));
 
-    // we need a scheduler for our fuzzer to choose how to schedule inputs in our corpus
+    // The Scheduler is the entity representing the policy to pop testcases from the Corpus.
+    // https://aflplus.plus/libafl-book/core_concepts/corpus.html
     let scheduler = RandScheduler::new();
-    // now we can build our fuzzer
+    
+    // We group the entities that are "actions", like the CorpusScheduler and the Feedbacks, in a common place, the Fuzzer.
+    // https://aflplus.plus/libafl-book/design/architecture.html
     let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
 
 
@@ -97,69 +92,10 @@ fn main() -> Result<()> {
     // since we lack feedback, we have to force this,
     // otherwise it will only load inputs it deems interesting
     // which will result in an empty corpus for us
-    state.load_initial_inputs_forced(&mut fuzzer, &mut kangaji, &mut mgr, &[PathBuf::from("./examples/01_getpid/corpus")]).unwrap();
+    state.load_initial_inputs_forced(&mut fuzzer, &mut executor, &mut mgr, &[PathBuf::from("./examples/01_getpid/corpus")]).unwrap();
 
     // fuzz
-    fuzzer.fuzz_loop(&mut stages, &mut kangaji, &mut state, &mut mgr).expect("Error in fuzz loop");
-    // loop {
-    //     vm.restore()?;
-    //     // patch some stuff
-    //     vm.write_virt(constants::USER_SINGLE_STEP_REPORT_ADDR, 0xc3 as u8); // remove in kernel single step SIGTRAP
+    fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut mgr).expect("Error in fuzz loop");
 
-    //     curr_input = if vm.new_coverage() {
-    //         input_data = curr_input;
-    //         input_data
-    //     } else {
-    //         input_data
-    //     };
-
-    //     // replace a random byte in the input with a new byte
-    //     let offset = rng.below(curr_input.len() as u64) as usize;
-    //     let rand_byte = rng.next_u32() as u8;
-    //     curr_input[offset] = rand_byte;
-    //     log::trace!("Setting byte {rand_byte:#x} at curr_input[{offset}]");
-    //     // set input data
-    //     vm.write_virt(0x555555556000, curr_input);
-    //     loop {
-    //         match vm.run()? {
-    //             VcpuExit::Debug(_) => {
-    //                 if vm.vcpu.sync_regs().regs.rip == constants::LIBC_GETPID_ADDR {
-    //                     // Hit breakpoint in getpid()
-    //                     // Set rax=0xdeadbeef & return
-    //                     let rsp = vm.vcpu.sync_regs().regs.rsp;
-    //                     let ret_addr = vm.read_virt::<u64>(rsp);
-    //                     log::debug!("RSP: {rsp:#x} -> {ret_addr:#x}");
-    //                     let mut regs = vm.vcpu.get_regs().unwrap();
-    //                     regs.rip = ret_addr;
-    //                     regs.rsp += 8;
-    //                     regs.rax = 0xdeadbeef;
-    //                     vm.vcpu.set_regs(&regs).unwrap();
-    //                 }
-    //                 if vm.vcpu.sync_regs().regs.rip == constants::STOP_ADDR {
-    //                     log::debug!("End of run! @{:#x}", vm.vcpu.sync_regs().regs.rip);
-    //                     break;
-    //                 }
-
-    //                 if vm.vcpu.sync_regs().regs.rip == constants::FORCE_SIG_FAULT_ADDR {
-    //                     let signal = i32::try_from(vm.vcpu.sync_regs().regs.rdi).unwrap();
-    //                     if signal == libc::SIGSEGV {
-    //                         log::info!(
-    //                             "We found a crash! code:{} address:{:#x}",
-    //                             vm.vcpu.sync_regs().regs.rsi,
-    //                             vm.vcpu.sync_regs().regs.rdx
-    //                         );
-    //                         return Ok(());
-    //                     } else {
-    //                         log::warn!("Fault with unexpected signal: {signal}");
-    //                     }
-    //                 }
-    //             }
-    //             r => {
-    //                 log::error!("Unexpected exit reason: VcpuExit::{r:x?}");
-    //                 break;
-    //             }
-    //         }
-    //     }
-    // }
     Ok(())
 }

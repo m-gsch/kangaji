@@ -377,9 +377,13 @@ impl Kangaji {
     }
 
     pub fn set_breakpoint(&self, virt_addr: u64) {
+        self.patch_byte(virt_addr, 0xcc);
+    }
+
+    pub fn patch_byte(&self, virt_addr: u64, value: u8) {
         let phys_addr = self.translate_addr(virt_addr);
-        self.write_phys(phys_addr, self.physmem_base, 0xcc as u8);
-        self.write_phys(phys_addr, self.snapshot_base, 0xcc as u8);
+        self.write_phys(phys_addr, self.physmem_base, value);
+        self.write_phys(phys_addr, self.snapshot_base, value);
     }
 
     pub fn set_coverage_breakpoints(&mut self, covbps_filepath: &str) -> Result<()> {
