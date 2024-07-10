@@ -16,15 +16,14 @@ use crate::cpu_state::CpuState;
 use crate::kvm::MemoryRegion;
 
 pub struct Kangaji {
-    physmem_base: u64,
-    physmem_size: usize,
-    snapshot_base: u64,
+    pub physmem_base: u64,
+    pub physmem_size: usize,
+    pub snapshot_base: u64,
     cpu_state: CpuState,
     pub vcpu: VcpuFd,
     pub vm: VmFd,
     pub memory_regions: [MemoryRegion; 2],
-    coverage_map: HashMap<u64, u8>,
-    is_interesting: bool,
+    pub coverage_map: HashMap<u64, u8>,
 }
 
 impl Kangaji {
@@ -191,11 +190,10 @@ impl Kangaji {
             vm,
             memory_regions: [slot0_mem_region, slot1_mem_region],
             coverage_map: HashMap::new(),
-            is_interesting: false,
         })
     }
 
-    fn translate_addr(&self, virt_addr: u64) -> u64 {
+    pub fn translate_addr(&self, virt_addr: u64) -> u64 {
         // Get Page Map Level 4 (PML4) table address from CR3
         // 2:0 Ignored
         // 3 (PWT)
@@ -363,7 +361,7 @@ impl Kangaji {
         self.read_phys::<T>(phys_addr, self.physmem_base)
     }
 
-    fn write_phys<T>(&self, phys_addr: u64, physmem_base: u64, value: T) {
+    pub fn write_phys<T>(&self, phys_addr: u64, physmem_base: u64, value: T) {
         assert!((phys_addr as usize + std::mem::size_of::<T>()) < self.physmem_size);
         unsafe {
             std::ptr::write_unaligned((physmem_base + phys_addr) as *mut T, value);
@@ -409,14 +407,6 @@ impl Kangaji {
 
     pub fn is_trace(&self) -> bool {
         1 == 0
-    }
-
-    pub fn new_coverage(&mut self) -> bool {
-        if self.is_interesting {
-            self.is_interesting = false;
-            return true;
-        }
-        false
     }
 
     pub fn restore(&mut self) -> Result<()> {
@@ -499,19 +489,7 @@ impl Kangaji {
                         let cr3 = self.vcpu.sync_regs().sregs.cr3;
                         log::debug!("{rip:#x?} {cr3:#x}");
                     } else {
-                        let rip = self.vcpu.sync_regs().regs.rip;
-                        if let Some((cov_addr, original_byte)) =
-                            self.coverage_map.remove_entry(&rip)
-                        {
-                            // We hit a coverage breakpoint
-                            log::info!("Hit coverage breakpoint at @{cov_addr:#x}");
-                            let phys_addr = self.translate_addr(cov_addr);
-                            self.write_phys(phys_addr, self.physmem_base, original_byte);
-                            self.write_phys(phys_addr, self.snapshot_base, original_byte);
-                            self.is_interesting = true;
-                        } else {
-                            return Ok(VcpuExit::Debug(debug_exit));
-                        }
+                        return Ok(VcpuExit::Debug(debug_exit));
                     }
                 }
                 _ => return Ok(VcpuExit::InternalError),

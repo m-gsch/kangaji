@@ -5,12 +5,12 @@ use libafl::{
     executors::{Executor, ExitKind, HasObservers},
     inputs::{HasTargetBytes, UsesInput},
     observers::{ObserversTuple, UsesObservers},
-    state::{HasExecutions, State, UsesState},
+    state::{HasExecutions, HasMaxSize, State, UsesState},
     Error,
 };
 use libafl_bolts::{tuples::MatchName, AsSlice};
 
-use crate::{constants, kangaji::Kangaji};
+use crate::{constants, kangaji::Kangaji, observer::CoverageBreakpointObserver};
 
 pub struct KangajiExecutor<OT, S> {
     pub vm: Kangaji,
@@ -36,7 +36,7 @@ where
 impl<EM, OT, S, Z> Executor<EM, Z> for KangajiExecutor<OT, S>
 where
     EM: UsesState<State = S>,
-    S: State + HasExecutions,
+    S: State + HasExecutions + HasMaxSize,
     S::Input: HasTargetBytes,
     OT: MatchName + ObserversTuple<S>,
     Z: UsesState<State = S>,
@@ -51,19 +51,39 @@ where
         self.vm.restore().unwrap();
         *state.executions_mut() += 1;
         let data = input.target_bytes();
-        let data = data.as_slice();
-        let mut input_data: [u8; 17] = [
-            0x66, 0x75, 0x7a, 0x7a, 0x6d, 0x65, 0x74, 0x6f, 0x73, 0x6f, 0x6c, 0x76, 0x65, 0x6d,
-            0x65, 0x61, 0x00, // "fuzzmetosolvemea\0"
-        ];
-        for i in 0..4 {
-            input_data[15-i] = *data.get(i).unwrap_or(&u8::MIN);
+        let mut data = data.as_slice();
+        if data.len() > state.max_size() {
+            data = &data[..state.max_size()]
         }
+
+        // [TODO] there should be a better way to do this, my write_phys implementation is poopoo
+        let mut input_data = [0u8; 17];
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(),input_data.as_mut_ptr(),data.len()) };
+
         // set input data
         self.vm.write_virt(0x555555556000, input_data);
         while let Ok(vcpu_exit) = self.vm.run() {
             match vcpu_exit {
                 VcpuExit::Debug(_) => {
+                    let rip = self.vm.vcpu.sync_regs().regs.rip;
+                    if let Some((cov_addr, original_byte)) = self.vm.coverage_map.remove_entry(&rip)
+                    {
+                        // We hit a coverage breakpoint
+                        log::info!("Hit coverage breakpoint at @{cov_addr:#x}");
+                        let phys_addr = self.vm.translate_addr(cov_addr);
+                        self.vm
+                            .write_phys(phys_addr, self.vm.physmem_base, original_byte);
+                        self.vm
+                            .write_phys(phys_addr, self.vm.snapshot_base, original_byte);
+                        let observer = self
+                            .observers_mut()
+                            .match_name_mut::<CoverageBreakpointObserver>(
+                                "CoverageBreakpointObserver",
+                            )
+                            .unwrap();
+                        observer.hit = true;
+                    }
+
                     if self.vm.vcpu.sync_regs().regs.rip == constants::LIBC_GETPID_ADDR {
                         // Hit breakpoint in getpid()
                         // Set rax=0xdeadbeef & return

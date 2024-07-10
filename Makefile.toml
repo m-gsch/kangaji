@@ -1,0 +1,27 @@
+[env]
+RUST_LOG = "info"
+
+[tasks.build]
+clear = true
+command = "cargo"
+args = [
+    "build",
+    "--release"
+]
+
+[tasks.run]
+clear = true
+command = "cargo"
+args = [
+    "run",
+    "--release"
+]
+
+[tasks.clean]
+clear = true
+script_runner = "@shell"
+script = '''
+rm -rf ./corpus
+rm -rf ./solutions
+cargo clean
+'''
