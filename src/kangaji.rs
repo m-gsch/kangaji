@@ -361,17 +361,21 @@ impl Kangaji {
         self.read_phys::<T>(phys_addr, self.physmem_base)
     }
 
-    pub fn write_phys<T>(&self, phys_addr: u64, physmem_base: u64, value: T) {
-        assert!((phys_addr as usize + std::mem::size_of::<T>()) < self.physmem_size);
+    pub fn write_phys(&self, phys_addr: u64, physmem_base: u64, bytes: &[u8]) {
+        assert!((phys_addr as usize + bytes.len()) < self.physmem_size);
         unsafe {
-            std::ptr::write_unaligned((physmem_base + phys_addr) as *mut T, value);
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                (physmem_base + phys_addr) as *mut u8,
+                bytes.len(),
+            );
         }
     }
 
-    pub fn write_virt<T>(&self, virt_addr: u64, value: T) {
+    pub fn write_virt(&self, virt_addr: u64, bytes: &[u8]) {
         let phys_addr = self.translate_addr(virt_addr);
         log::trace!("virt_addr({virt_addr:#x}) -> phys_addr({phys_addr:#x})");
-        self.write_phys(phys_addr, self.physmem_base, value);
+        self.write_phys(phys_addr, self.physmem_base, bytes);
     }
 
     pub fn set_breakpoint(&self, virt_addr: u64) {
@@ -380,8 +384,8 @@ impl Kangaji {
 
     pub fn patch_byte(&self, virt_addr: u64, value: u8) {
         let phys_addr = self.translate_addr(virt_addr);
-        self.write_phys(phys_addr, self.physmem_base, value);
-        self.write_phys(phys_addr, self.snapshot_base, value);
+        self.write_phys(phys_addr, self.physmem_base, &value.to_ne_bytes());
+        self.write_phys(phys_addr, self.snapshot_base, &value.to_ne_bytes());
     }
 
     pub fn set_coverage_breakpoints(&mut self, covbps_filepath: &str) -> Result<()> {

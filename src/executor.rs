@@ -1,4 +1,4 @@
-use std::marker::PhantomData;
+use std::{borrow::Cow, marker::PhantomData};
 
 use kvm_ioctls::VcpuExit;
 use libafl::{
@@ -8,12 +8,15 @@ use libafl::{
     state::{HasExecutions, HasMaxSize, State, UsesState},
     Error,
 };
-use libafl_bolts::{tuples::MatchName, AsSlice};
+use libafl_bolts::{
+    tuples::{Handle, MatchName, MatchNameRef, RefIndexable},
+    AsSlice,
+};
 
 use crate::{constants, kangaji::Kangaji, observer::CoverageBreakpointObserver};
 
 pub struct KangajiExecutor<OT, S> {
-    pub vm: Kangaji,
+    vm: Kangaji,
     /// The observers used by this executor
     observers: OT,
     phantom: PhantomData<S>,
@@ -56,12 +59,8 @@ where
             data = &data[..state.max_size()]
         }
 
-        // [TODO] there should be a better way to do this, my write_phys implementation is poopoo
-        let mut input_data = [0u8; 17];
-        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(),input_data.as_mut_ptr(),data.len()) };
-
         // set input data
-        self.vm.write_virt(0x555555556000, input_data);
+        self.vm.write_virt(0x555555556000, data);
         while let Ok(vcpu_exit) = self.vm.run() {
             match vcpu_exit {
                 VcpuExit::Debug(_) => {
@@ -70,17 +69,11 @@ where
                     {
                         // We hit a coverage breakpoint
                         log::info!("Hit coverage breakpoint at @{cov_addr:#x}");
-                        let phys_addr = self.vm.translate_addr(cov_addr);
-                        self.vm
-                            .write_phys(phys_addr, self.vm.physmem_base, original_byte);
-                        self.vm
-                            .write_phys(phys_addr, self.vm.snapshot_base, original_byte);
-                        let observer = self
-                            .observers_mut()
-                            .match_name_mut::<CoverageBreakpointObserver>(
-                                "CoverageBreakpointObserver",
-                            )
-                            .unwrap();
+                        self.vm.patch_byte(cov_addr, original_byte);
+                        let handle = &Handle::new(Cow::Borrowed("CoverageBreakpointObserver"));
+                        let mut observers = self.observers_mut();
+                        let observer: &mut CoverageBreakpointObserver =
+                            observers.get_mut(handle).unwrap();
                         observer.hit = true;
                     }
 
@@ -145,11 +138,11 @@ where
     S: State,
     OT: ObserversTuple<S>,
 {
-    fn observers(&self) -> &OT {
-        &self.observers
+    fn observers(&self) -> RefIndexable<&OT, OT> {
+        RefIndexable::from(&self.observers)
     }
 
-    fn observers_mut(&mut self) -> &mut OT {
-        &mut self.observers
+    fn observers_mut(&mut self) -> RefIndexable<&mut OT, OT> {
+        RefIndexable::from(&mut self.observers)
     }
 }

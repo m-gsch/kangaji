@@ -1,8 +1,10 @@
+use std::borrow::Cow;
+
 use libafl::{inputs::UsesInput, observers::Observer};
-use libafl_bolts:: Named;
+use libafl_bolts::Named;
 use serde::{Deserialize, Serialize};
 
-#[derive(Default,Deserialize,Serialize)]
+#[derive(Default, Deserialize, Serialize)]
 pub struct CoverageBreakpointObserver {
     pub hit: bool,
 }
@@ -22,7 +24,8 @@ where
 }
 
 impl Named for CoverageBreakpointObserver {
-    fn name(&self) -> &str {
-        "CoverageBreakpointObserver"
+    fn name(&self) -> &Cow<'static, str> {
+        static NAME: Cow<'static, str> = Cow::Borrowed("CoverageBreakpointObserver");
+        &NAME
     }
 }

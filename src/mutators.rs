@@ -1,5 +1,7 @@
+use std::borrow::Cow;
+
 use libafl::{
-    inputs::HasBytesVec,
+    inputs::HasMutatorBytes,
     mutators::{MutationResult, Mutator},
     state::{HasMaxSize, HasRand},
 };
@@ -18,14 +20,14 @@ pub struct CharSwapMutator {
 impl<I, S> Mutator<I, S> for CharSwapMutator
 where
     S: HasRand,
-    I: HasBytesVec,
+    I: HasMutatorBytes,
 {
     fn mutate(&mut self, state: &mut S, input: &mut I) -> Result<MutationResult, libafl::Error> {
         if input.bytes().is_empty() {
             Ok(MutationResult::Skipped)
         } else {
-            let char = state.rand_mut().choose(self.printable);
-            let byte = state.rand_mut().choose(input.bytes_mut());
+            let char = state.rand_mut().choose(self.printable).unwrap();
+            let byte = state.rand_mut().choose(input.bytes_mut()).unwrap();
             *byte = char;
             Ok(MutationResult::Mutated)
         }
@@ -33,8 +35,9 @@ where
 }
 
 impl Named for CharSwapMutator {
-    fn name(&self) -> &str {
-        "CharSwapMutator"
+    fn name(&self) -> &Cow<'static, str> {
+        static NAME: Cow<'static, str> = Cow::Borrowed("CharSwapMutator");
+        &NAME
     }
 }
 
@@ -57,7 +60,7 @@ pub struct CharExpandMutator {
 impl<I, S> Mutator<I, S> for CharExpandMutator
 where
     S: HasRand + HasMaxSize,
-    I: HasBytesVec,
+    I: HasMutatorBytes,
 {
     fn mutate(&mut self, state: &mut S, input: &mut I) -> Result<MutationResult, libafl::Error> {
         let max_size = state.max_size();
@@ -66,15 +69,16 @@ where
             return Ok(MutationResult::Skipped);
         }
         let size = input.bytes().len();
-        let char = state.rand_mut().choose(self.printable);
-        input.bytes_mut().resize(size + 1, char);
+        let char = state.rand_mut().choose(self.printable).unwrap();
+        input.resize(size + 1, char);
         Ok(MutationResult::Mutated)
     }
 }
 
 impl Named for CharExpandMutator {
-    fn name(&self) -> &str {
-        "CharExpandMutator"
+    fn name(&self) -> &Cow<'static, str> {
+        static NAME: Cow<'static, str> = Cow::Borrowed("CharExpandMutator");
+        &NAME
     }
 }
 
