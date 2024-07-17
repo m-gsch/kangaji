@@ -4,7 +4,7 @@ use kvm_ioctls::VcpuExit;
 use libafl::{
     executors::{Executor, ExitKind, HasObservers},
     inputs::{HasTargetBytes, UsesInput},
-    observers::{ObserversTuple, UsesObservers},
+    observers::{ListObserver, ObserversTuple, UsesObservers},
     state::{HasExecutions, HasMaxSize, State, UsesState},
     Error,
 };
@@ -13,7 +13,7 @@ use libafl_bolts::{
     AsSlice,
 };
 
-use crate::{constants, kangaji::Kangaji, observer::CoverageBreakpointObserver};
+use crate::{constants, kangaji::Kangaji};
 
 pub struct KangajiExecutor<OT, S> {
     vm: Kangaji,
@@ -70,11 +70,12 @@ where
                         // We hit a coverage breakpoint
                         log::info!("Hit coverage breakpoint at @{cov_addr:#x}");
                         self.vm.patch_byte(cov_addr, original_byte);
-                        let handle = &Handle::new(Cow::Borrowed("CoverageBreakpointObserver"));
+                        let phys_addr = self.vm.translate_addr(cov_addr).to_ne_bytes();
+                        let handle = Handle::new(Cow::Borrowed("CoverageBreakpointObserver"));
                         let mut observers = self.observers_mut();
-                        let observer: &mut CoverageBreakpointObserver =
-                            observers.get_mut(handle).unwrap();
-                        observer.hit = true;
+                        let observer = observers.get_mut::<ListObserver<u8>>(&handle).unwrap();
+                        observer.list_mut().extend_from_slice(&phys_addr);
+                        observer.list_mut().push(original_byte);
                     }
 
                     if self.vm.vcpu.sync_regs().regs.rip == constants::LIBC_GETPID_ADDR {

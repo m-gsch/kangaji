@@ -15,6 +15,8 @@ use crate::constants;
 use crate::cpu_state::CpuState;
 use crate::kvm::MemoryRegion;
 
+pub static mut SNAPSHOT_BASE: u64 = 0;
+pub static mut PHYSMEM_BASE: u64 = 0;
 pub struct Kangaji {
     pub physmem_base: u64,
     pub physmem_size: usize,
@@ -104,6 +106,8 @@ impl Kangaji {
                 0,
             ) as u64
         };
+        // Store it in a global so we can use it in custom_buf_handler without a reference to Self
+        unsafe { PHYSMEM_BASE = physmem_base };
 
         // Snapshot for restoring memory
         let snapshot_base = unsafe {
@@ -116,6 +120,9 @@ impl Kangaji {
                 0,
             ) as u64
         };
+
+        // Store it in a global so we can use it in custom_buf_handler without a reference to Self
+        unsafe { SNAPSHOT_BASE = snapshot_base };
 
         // Set memory regions in the guest
         // if setting LAPIC, KVM internally creates a memory region for APIC at APIC_BASE of page size
@@ -361,8 +368,8 @@ impl Kangaji {
         self.read_phys::<T>(phys_addr, self.physmem_base)
     }
 
-    pub fn write_phys(&self, phys_addr: u64, physmem_base: u64, bytes: &[u8]) {
-        assert!((phys_addr as usize + bytes.len()) < self.physmem_size);
+    pub fn write_phys(phys_addr: u64, physmem_base: u64, bytes: &[u8]) {
+        // assert!((phys_addr as usize + bytes.len()) < self.physmem_size);
         unsafe {
             std::ptr::copy_nonoverlapping(
                 bytes.as_ptr(),
@@ -375,7 +382,7 @@ impl Kangaji {
     pub fn write_virt(&self, virt_addr: u64, bytes: &[u8]) {
         let phys_addr = self.translate_addr(virt_addr);
         log::trace!("virt_addr({virt_addr:#x}) -> phys_addr({phys_addr:#x})");
-        self.write_phys(phys_addr, self.physmem_base, bytes);
+        Kangaji::write_phys(phys_addr, self.physmem_base, bytes);
     }
 
     pub fn set_breakpoint(&self, virt_addr: u64) {
@@ -384,8 +391,8 @@ impl Kangaji {
 
     pub fn patch_byte(&self, virt_addr: u64, value: u8) {
         let phys_addr = self.translate_addr(virt_addr);
-        self.write_phys(phys_addr, self.physmem_base, &value.to_ne_bytes());
-        self.write_phys(phys_addr, self.snapshot_base, &value.to_ne_bytes());
+        Kangaji::write_phys(phys_addr, self.physmem_base, &value.to_ne_bytes());
+        Kangaji::write_phys(phys_addr, self.snapshot_base, &value.to_ne_bytes());
     }
 
     pub fn set_coverage_breakpoints(&mut self, covbps_filepath: &str) -> Result<()> {

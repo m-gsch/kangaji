@@ -21,7 +21,7 @@ args = [
 clear = true
 script_runner = "@shell"
 script = '''
-rm -rf ./corpus
-rm -rf ./solutions
+rm -rf ./examples/corpus
+rm -rf ./examples/solutions
 cargo clean
 '''
