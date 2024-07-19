@@ -1,8 +1,4 @@
-[env]
-RUST_LOG = "info"
-
 [tasks.build]
-clear = true
 command = "cargo"
 args = [
     "build",
@@ -10,18 +6,27 @@ args = [
 ]
 
 [tasks.run]
-clear = true
 command = "cargo"
 args = [
     "run",
-    "--release"
+    "--release",
+    "--",
+    "${@}"
 ]
+
+[tasks.info]
+env = { "RUST_LOG" = "info" }
+run_task = "run"
+
+[tasks.debug]
+env = { "RUST_LOG" = "debug" }
+run_task = "run"
 
 [tasks.clean]
 clear = true
 script_runner = "@shell"
 script = '''
-rm -rf ./examples/corpus
-rm -rf ./examples/solutions
+rm -rf ./corpus
+rm -rf ./solutions
 cargo clean
 '''

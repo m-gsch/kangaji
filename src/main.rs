@@ -1,9 +1,6 @@
 use libafl::{
     corpus::{CachedOnDiskCorpus, OnDiskCorpus},
-    events::{
-        CustomBufEventResult, EventConfig, HasCustomBufHandlers, Launcher,
-        LlmpRestartingEventManager,
-    },
+    events::{EventConfig, Launcher, LlmpRestartingEventManager},
     feedbacks::CrashFeedback,
     generators::RandPrintablesGenerator,
     monitors::MultiMonitor,
@@ -15,11 +12,12 @@ use libafl::{
     Fuzzer, StdFuzzer,
 };
 use libafl_bolts::{
-    core_affinity::Cores,
+    core_affinity::CoreId,
     ownedref::OwnedMutPtr,
     rands,
     shmem::{ShMemProvider, StdShMemProvider},
     tuples::tuple_list,
+    cli
 };
 
 mod constants;
@@ -33,35 +31,10 @@ mod observer;
 
 fn main() {
     env_logger::init();
+    let options = cli::parse_args();
 
     let mut run_client =
-        |state: Option<_>, mut mgr: LlmpRestartingEventManager<_, _, _>, _core_id| {
-            let buf_handler: Box<
-                dyn FnMut(&mut _, &str, &[u8]) -> Result<CustomBufEventResult, libafl::Error>,
-            > = Box::new(|_state, _s, bytes| {
-                for addr_bytes in bytes.chunks_exact(9) {
-                    let cov_addr = u64::from_ne_bytes(addr_bytes[..8].try_into().unwrap());
-                    log::info!(
-                        "Clearing breakpoint at @{cov_addr:#x} byte[{:#x}]",
-                        addr_bytes[8]
-                    );
-                    // [TODO] if we clear the breakpoints before sending the NewTestcase to the other cores it is not included in their corpus :(
-                    unsafe {
-                        kangaji::Kangaji::write_phys(
-                            cov_addr,
-                            kangaji::SNAPSHOT_BASE,
-                            addr_bytes[8..].try_into().unwrap(),
-                        );
-                        kangaji::Kangaji::write_phys(
-                            cov_addr,
-                            kangaji::PHYSMEM_BASE,
-                            addr_bytes[8..].try_into().unwrap(),
-                        );
-                    }
-                }
-                Ok(CustomBufEventResult::Handled)
-            });
-            mgr.add_custom_buf_handler(buf_handler);
+        |state: Option<_>, mut mgr: LlmpRestartingEventManager<_, _, _>, core_id: CoreId| {
             let mut kangaji = kangaji::Kangaji::new(
                 "examples/01_getpid/fuzzvm.physmem",
                 "examples/01_getpid/fuzzvm.qemuregs",
@@ -93,11 +66,12 @@ fn main() {
 
             // The State contains all the metadata that are evolved while running the fuzzer, Corpus included.
             // https://aflplus.plus/libafl-book/design/architecture.html
+            let corpus_dir = options.input[0].join(format!("core_{:03}",core_id.0));
             let mut state = state.unwrap_or_else(|| {
                 StdState::new(
                     rands::StdRand::new(),
-                    CachedOnDiskCorpus::new("./examples/corpus", 4096).unwrap(),
-                    OnDiskCorpus::new("./examples/solutions").unwrap(),
+                    CachedOnDiskCorpus::no_meta(corpus_dir, 4096).unwrap(),
+                    OnDiskCorpus::new(options.output.clone()).unwrap(),
                     &mut feedback,
                     &mut objective,
                 )
@@ -157,11 +131,11 @@ fn main() {
     // Build and run a Launcher
     match Launcher::builder()
         .shmem_provider(shmem_provider)
-        .broker_port(1337)
+        .broker_port(options.broker_port)
         .configuration(EventConfig::from_build_id())
         .monitor(monitor)
         .run_client(&mut run_client)
-        .cores(&Cores::from_cmdline("1-4").unwrap())
+        .cores(&options.cores)
         .build()
         .launch()
     {

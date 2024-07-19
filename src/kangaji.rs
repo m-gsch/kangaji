@@ -15,8 +15,6 @@ use crate::constants;
 use crate::cpu_state::CpuState;
 use crate::kvm::MemoryRegion;
 
-pub static mut SNAPSHOT_BASE: u64 = 0;
-pub static mut PHYSMEM_BASE: u64 = 0;
 pub struct Kangaji {
     pub physmem_base: u64,
     pub physmem_size: usize,
@@ -106,8 +104,6 @@ impl Kangaji {
                 0,
             ) as u64
         };
-        // Store it in a global so we can use it in custom_buf_handler without a reference to Self
-        unsafe { PHYSMEM_BASE = physmem_base };
 
         // Snapshot for restoring memory
         let snapshot_base = unsafe {
@@ -120,9 +116,6 @@ impl Kangaji {
                 0,
             ) as u64
         };
-
-        // Store it in a global so we can use it in custom_buf_handler without a reference to Self
-        unsafe { SNAPSHOT_BASE = snapshot_base };
 
         // Set memory regions in the guest
         // if setting LAPIC, KVM internally creates a memory region for APIC at APIC_BASE of page size

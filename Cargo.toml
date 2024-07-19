@@ -9,7 +9,7 @@ env_logger = "0.11.3"
 kvm-bindings = "0.8"
 kvm-ioctls = "0.17"
 libafl = {path = "/home/ubuntu/LibAFL/libafl"}
-libafl_bolts = {path = "/home/ubuntu/LibAFL/libafl_bolts"}
+libafl_bolts = {path = "/home/ubuntu/LibAFL/libafl_bolts", features = ["cli"]}
 libc = "0.2"
 log = "0.4.21"
 rand = "0.8.5"
